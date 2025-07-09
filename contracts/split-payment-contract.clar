@@ -17,7 +17,8 @@
     total-tokens: uint,
     available-tokens: uint,
     price-per-token: uint,
-    is-active: bool
+    is-active: bool,
+    is-listed: bool
   }
 )
 
@@ -51,7 +52,8 @@
         total-tokens: total-tokens,
         available-tokens: total-tokens,
         price-per-token: price-per-token,
-        is-active: true
+        is-active: true,
+        is-listed: true
       }
     )
     (var-set next-property-id (+ property-id u1))
@@ -154,8 +156,34 @@
   )
 )
 
+(define-public (toggle-property-listing (property-id uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+    (map-set properties
+      { property-id: property-id }
+      (merge property { is-listed: (not (get is-listed property)) })
+    )
+    (ok (not (get is-listed property)))
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties { property-id: property-id })
+)
+
+(define-read-only (get-listed-property (property-id uint))
+  (let
+    (
+      (property (map-get? properties { property-id: property-id }))
+    )
+    (match property
+      prop (if (get is-listed prop) (some prop) none)
+      none
+    )
+  )
 )
 
 (define-read-only (get-user-tokens (property-id uint) (user principal))
@@ -190,5 +218,21 @@
       (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
     )
     (ok (* (get price-per-token property) token-amount))
+  )
+)
+
+(define-read-only (get-total-properties)
+  (- (var-get next-property-id) u1)
+)
+
+(define-read-only (get-property-listing-status (property-id uint))
+  (let
+    (
+      (property (map-get? properties { property-id: property-id }))
+    )
+    (match property
+      prop (some (get is-listed prop))
+      none
+    )
   )
 )

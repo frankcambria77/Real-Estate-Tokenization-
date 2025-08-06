@@ -7,6 +7,8 @@
 (define-constant err-invalid-amount (err u105))
 (define-constant err-property-not-active (err u106))
 (define-constant err-insufficient-tokens (err u107))
+(define-constant err-invalid-valuation (err u108))
+(define-constant err-valuation-change-too-large (err u109))
 
 (define-map properties
   { property-id: uint }
@@ -34,6 +36,21 @@
 
 (define-data-var next-property-id uint u1)
 
+(define-map property-valuations
+  { property-id: uint, valuation-id: uint }
+  {
+    new-value: uint,
+    old-value: uint,
+    valuation-date: uint,
+    updated-by: principal
+  }
+)
+
+(define-map property-valuation-count
+  { property-id: uint }
+  { count: uint }
+)
+
 (define-public (create-property (name (string-ascii 50)) (total-value uint) (total-tokens uint))
   (let
     (
@@ -55,6 +72,10 @@
         is-active: true,
         is-listed: true
       }
+    )
+    (map-set property-valuation-count
+      { property-id: property-id }
+      { count: u0 }
     )
     (var-set next-property-id (+ property-id u1))
     (ok property-id)
@@ -170,6 +191,46 @@
   )
 )
 
+(define-public (update-property-valuation (property-id uint) (new-value uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+      (current-value (get total-value property))
+      (total-tokens (get total-tokens property))
+      (new-price-per-token (/ new-value total-tokens))
+      (valuation-count (default-to u0 (get count (map-get? property-valuation-count { property-id: property-id }))))
+      (next-valuation-id (+ valuation-count u1))
+      (max-change (* current-value u2))
+      (min-change (/ current-value u2))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+    (asserts! (> new-value u0) err-invalid-valuation)
+    (asserts! (<= new-value max-change) err-valuation-change-too-large)
+    (asserts! (>= new-value min-change) err-valuation-change-too-large)
+    (map-set properties
+      { property-id: property-id }
+      (merge property { 
+        total-value: new-value,
+        price-per-token: new-price-per-token
+      })
+    )
+    (map-set property-valuations
+      { property-id: property-id, valuation-id: next-valuation-id }
+      {
+        new-value: new-value,
+        old-value: current-value,
+        valuation-date: burn-block-height,
+        updated-by: tx-sender
+      }
+    )
+    (map-set property-valuation-count
+      { property-id: property-id }
+      { count: next-valuation-id }
+    )
+    (ok new-value)
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties { property-id: property-id })
 )
@@ -232,6 +293,48 @@
     )
     (match property
       prop (some (get is-listed prop))
+      none
+    )
+  )
+)
+
+(define-read-only (get-property-valuation-history (property-id uint) (valuation-id uint))
+  (map-get? property-valuations { property-id: property-id, valuation-id: valuation-id })
+)
+
+(define-read-only (get-property-valuation-count (property-id uint))
+  (default-to u0 (get count (map-get? property-valuation-count { property-id: property-id })))
+)
+
+(define-read-only (get-latest-property-valuation (property-id uint))
+  (let
+    (
+      (valuation-count (get-property-valuation-count property-id))
+    )
+    (if (> valuation-count u0)
+      (map-get? property-valuations { property-id: property-id, valuation-id: valuation-count })
+      none
+    )
+  )
+)
+
+(define-read-only (calculate-valuation-change-percentage (property-id uint))
+  (let
+    (
+      (latest-valuation (get-latest-property-valuation property-id))
+    )
+    (match latest-valuation
+      valuation 
+        (let
+          (
+            (new-val (get new-value valuation))
+            (old-val (get old-value valuation))
+          )
+          (if (> old-val u0)
+            (some (/ (* (- new-val old-val) u10000) old-val))
+            none
+          )
+        )
       none
     )
   )

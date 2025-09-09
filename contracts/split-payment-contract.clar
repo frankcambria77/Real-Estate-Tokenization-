@@ -9,6 +9,9 @@
 (define-constant err-insufficient-tokens (err u107))
 (define-constant err-invalid-valuation (err u108))
 (define-constant err-valuation-change-too-large (err u109))
+(define-constant err-rental-period-not-found (err u110))
+(define-constant err-already-claimed (err u111))
+(define-constant err-no-rental-income (err u112))
 
 (define-map properties
   { property-id: uint }
@@ -51,6 +54,35 @@
   { count: uint }
 )
 
+(define-map rental-periods
+  { property-id: uint, period-id: uint }
+  {
+    rental-amount: uint,
+    period-start: uint,
+    period-end: uint,
+    total-tokens-snapshot: uint,
+    distributed: bool
+  }
+)
+
+(define-map rental-period-count
+  { property-id: uint }
+  { count: uint }
+)
+
+(define-map rental-claims
+  { property-id: uint, period-id: uint, holder: principal }
+  { 
+    amount-claimed: uint,
+    claimed: bool
+  }
+)
+
+(define-map user-rental-balance
+  { property-id: uint, holder: principal }
+  { unclaimed-amount: uint }
+)
+
 (define-public (create-property (name (string-ascii 50)) (total-value uint) (total-tokens uint))
   (let
     (
@@ -74,6 +106,10 @@
       }
     )
     (map-set property-valuation-count
+      { property-id: property-id }
+      { count: u0 }
+    )
+    (map-set rental-period-count
       { property-id: property-id }
       { count: u0 }
     )
@@ -231,6 +267,89 @@
   )
 )
 
+(define-public (deposit-rental-income (property-id uint) (rental-amount uint) (period-start uint) (period-end uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+      (rental-count (default-to u0 (get count (map-get? rental-period-count { property-id: property-id }))))
+      (next-period-id (+ rental-count u1))
+      (total-tokens-issued (- (get total-tokens property) (get available-tokens property)))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+    (asserts! (> rental-amount u0) err-invalid-amount)
+    (asserts! (> total-tokens-issued u0) err-insufficient-tokens)
+    (asserts! (< period-start period-end) err-invalid-amount)
+    (try! (stx-transfer? rental-amount tx-sender (as-contract tx-sender)))
+    (map-set rental-periods
+      { property-id: property-id, period-id: next-period-id }
+      {
+        rental-amount: rental-amount,
+        period-start: period-start,
+        period-end: period-end,
+        total-tokens-snapshot: total-tokens-issued,
+        distributed: false
+      }
+    )
+    (map-set rental-period-count
+      { property-id: property-id }
+      { count: next-period-id }
+    )
+    (ok next-period-id)
+  )
+)
+
+(define-public (claim-rental-income (property-id uint) (period-id uint))
+  (let
+    (
+      (rental-period (unwrap! (map-get? rental-periods { property-id: property-id, period-id: period-id }) err-rental-period-not-found))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (total-tokens-snapshot (get total-tokens-snapshot rental-period))
+      (rental-amount (get rental-amount rental-period))
+      (claim-record (map-get? rental-claims { property-id: property-id, period-id: period-id, holder: tx-sender }))
+      (user-share (/ (* user-tokens rental-amount) total-tokens-snapshot))
+    )
+    (asserts! (> user-tokens u0) err-insufficient-tokens)
+    (asserts! (is-none claim-record) err-already-claimed)
+    (asserts! (> rental-amount u0) err-no-rental-income)
+    (try! (as-contract (stx-transfer? user-share tx-sender tx-sender)))
+    (map-set rental-claims
+      { property-id: property-id, period-id: period-id, holder: tx-sender }
+      {
+        amount-claimed: user-share,
+        claimed: true
+      }
+    )
+    (ok user-share)
+  )
+)
+
+(define-read-only (get-unclaimed-rental-for-period (property-id uint) (period-id uint) (holder principal))
+  (let
+    (
+      (rental-period (map-get? rental-periods { property-id: property-id, period-id: period-id }))
+      (claim-record (map-get? rental-claims { property-id: property-id, period-id: period-id, holder: holder }))
+      (user-tokens (get-user-tokens property-id holder))
+    )
+    (match rental-period
+      period
+        (if (is-none claim-record)
+          (let
+            (
+              (rental-amount (get rental-amount period))
+              (total-tokens-snapshot (get total-tokens-snapshot period))
+            )
+            (if (> total-tokens-snapshot u0)
+              (some (/ (* user-tokens rental-amount) total-tokens-snapshot))
+              none
+            )
+          )
+          none
+        )
+      none
+    )
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties { property-id: property-id })
 )
@@ -336,6 +455,38 @@
           )
         )
       none
+    )
+  )
+)
+
+(define-read-only (get-rental-period (property-id uint) (period-id uint))
+  (map-get? rental-periods { property-id: property-id, period-id: period-id })
+)
+
+(define-read-only (get-rental-period-count (property-id uint))
+  (default-to u0 (get count (map-get? rental-period-count { property-id: property-id })))
+)
+
+(define-read-only (get-rental-claim (property-id uint) (period-id uint) (holder principal))
+  (map-get? rental-claims { property-id: property-id, period-id: period-id, holder: holder })
+)
+
+(define-read-only (get-total-rental-for-property (property-id uint))
+  (let
+    (
+      (rental-count (get-rental-period-count property-id))
+      (period-1 (map-get? rental-periods { property-id: property-id, period-id: u1 }))
+      (period-2 (map-get? rental-periods { property-id: property-id, period-id: u2 }))
+      (period-3 (map-get? rental-periods { property-id: property-id, period-id: u3 }))
+      (period-4 (map-get? rental-periods { property-id: property-id, period-id: u4 }))
+      (period-5 (map-get? rental-periods { property-id: property-id, period-id: u5 }))
+    )
+    (+ 
+      (match period-1 p1 (get rental-amount p1) u0)
+      (match period-2 p2 (get rental-amount p2) u0)
+      (match period-3 p3 (get rental-amount p3) u0)
+      (match period-4 p4 (get rental-amount p4) u0)
+      (match period-5 p5 (get rental-amount p5) u0)
     )
   )
 )

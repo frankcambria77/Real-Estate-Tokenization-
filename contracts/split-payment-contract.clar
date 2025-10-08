@@ -12,6 +12,10 @@
 (define-constant err-rental-period-not-found (err u110))
 (define-constant err-already-claimed (err u111))
 (define-constant err-no-rental-income (err u112))
+(define-constant err-offer-not-found (err u113))
+(define-constant err-offer-expired (err u114))
+(define-constant err-invalid-price (err u115))
+(define-constant err-offer-already-exists (err u116))
 
 (define-map properties
   { property-id: uint }
@@ -81,6 +85,36 @@
 (define-map user-rental-balance
   { property-id: uint, holder: principal }
   { unclaimed-amount: uint }
+)
+
+(define-map sell-offers
+  { property-id: uint, seller: principal, offer-id: uint }
+  {
+    token-amount: uint,
+    price-per-token: uint,
+    expiry-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map buy-offers
+  { property-id: uint, buyer: principal, offer-id: uint }
+  {
+    token-amount: uint,
+    price-per-token: uint,
+    expiry-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map user-sell-offer-count
+  { property-id: uint, seller: principal }
+  { count: uint }
+)
+
+(define-map user-buy-offer-count
+  { property-id: uint, buyer: principal }
+  { count: uint }
 )
 
 (define-public (create-property (name (string-ascii 50)) (total-value uint) (total-tokens uint))
@@ -487,6 +521,252 @@
       (match period-3 p3 (get rental-amount p3) u0)
       (match period-4 p4 (get rental-amount p4) u0)
       (match period-5 p5 (get rental-amount p5) u0)
+    )
+  )
+)
+
+(define-public (create-sell-offer (property-id uint) (token-amount uint) (price-per-token uint) (expiry-blocks uint))
+  (let
+    (
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (offer-count (default-to u0 (get count (map-get? user-sell-offer-count { property-id: property-id, seller: tx-sender }))))
+      (next-offer-id (+ offer-count u1))
+      (expiry-block (+ burn-block-height expiry-blocks))
+    )
+    (asserts! (>= user-tokens token-amount) err-insufficient-tokens)
+    (asserts! (> token-amount u0) err-invalid-amount)
+    (asserts! (> price-per-token u0) err-invalid-price)
+    (asserts! (> expiry-blocks u0) err-invalid-amount)
+    (map-set sell-offers
+      { property-id: property-id, seller: tx-sender, offer-id: next-offer-id }
+      {
+        token-amount: token-amount,
+        price-per-token: price-per-token,
+        expiry-block: expiry-block,
+        is-active: true
+      }
+    )
+    (map-set user-sell-offer-count
+      { property-id: property-id, seller: tx-sender }
+      { count: next-offer-id }
+    )
+    (ok next-offer-id)
+  )
+)
+
+(define-public (create-buy-offer (property-id uint) (token-amount uint) (price-per-token uint) (expiry-blocks uint))
+  (let
+    (
+      (total-cost (* token-amount price-per-token))
+      (offer-count (default-to u0 (get count (map-get? user-buy-offer-count { property-id: property-id, buyer: tx-sender }))))
+      (next-offer-id (+ offer-count u1))
+      (expiry-block (+ burn-block-height expiry-blocks))
+    )
+    (asserts! (> token-amount u0) err-invalid-amount)
+    (asserts! (> price-per-token u0) err-invalid-price)
+    (asserts! (> expiry-blocks u0) err-invalid-amount)
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    (map-set buy-offers
+      { property-id: property-id, buyer: tx-sender, offer-id: next-offer-id }
+      {
+        token-amount: token-amount,
+        price-per-token: price-per-token,
+        expiry-block: expiry-block,
+        is-active: true
+      }
+    )
+    (map-set user-buy-offer-count
+      { property-id: property-id, buyer: tx-sender }
+      { count: next-offer-id }
+    )
+    (ok next-offer-id)
+  )
+)
+
+(define-public (accept-sell-offer (property-id uint) (seller principal) (offer-id uint) (token-amount uint))
+  (let
+    (
+      (sell-offer (unwrap! (map-get? sell-offers { property-id: property-id, seller: seller, offer-id: offer-id }) err-offer-not-found))
+      (price-per-token (get price-per-token sell-offer))
+      (total-cost (* token-amount price-per-token))
+      (seller-tokens (get-user-tokens property-id seller))
+      (buyer-tokens (get-user-tokens property-id tx-sender))
+      (seller-user-tokens (default-to u0 (get tokens-owned (map-get? user-properties { user: seller, property-id: property-id }))))
+      (buyer-user-tokens (default-to u0 (get tokens-owned (map-get? user-properties { user: tx-sender, property-id: property-id }))))
+    )
+    (asserts! (get is-active sell-offer) err-offer-not-found)
+    (asserts! (<= burn-block-height (get expiry-block sell-offer)) err-offer-expired)
+    (asserts! (<= token-amount (get token-amount sell-offer)) err-insufficient-tokens)
+    (asserts! (>= seller-tokens token-amount) err-insufficient-tokens)
+    (asserts! (> token-amount u0) err-invalid-amount)
+    (try! (stx-transfer? total-cost tx-sender seller))
+    (map-set property-tokens
+      { property-id: property-id, holder: seller }
+      { amount: (- seller-tokens token-amount) }
+    )
+    (map-set property-tokens
+      { property-id: property-id, holder: tx-sender }
+      { amount: (+ buyer-tokens token-amount) }
+    )
+    (map-set user-properties
+      { user: seller, property-id: property-id }
+      { tokens-owned: (- seller-user-tokens token-amount) }
+    )
+    (map-set user-properties
+      { user: tx-sender, property-id: property-id }
+      { tokens-owned: (+ buyer-user-tokens token-amount) }
+    )
+    (if (is-eq token-amount (get token-amount sell-offer))
+      (map-set sell-offers
+        { property-id: property-id, seller: seller, offer-id: offer-id }
+        (merge sell-offer { is-active: false })
+      )
+      (map-set sell-offers
+        { property-id: property-id, seller: seller, offer-id: offer-id }
+        (merge sell-offer { token-amount: (- (get token-amount sell-offer) token-amount) })
+      )
+    )
+    (ok token-amount)
+  )
+)
+
+(define-public (accept-buy-offer (property-id uint) (buyer principal) (offer-id uint) (token-amount uint))
+  (let
+    (
+      (buy-offer (unwrap! (map-get? buy-offers { property-id: property-id, buyer: buyer, offer-id: offer-id }) err-offer-not-found))
+      (price-per-token (get price-per-token buy-offer))
+      (total-payment (* token-amount price-per-token))
+      (seller-tokens (get-user-tokens property-id tx-sender))
+      (buyer-tokens (get-user-tokens property-id buyer))
+      (seller-user-tokens (default-to u0 (get tokens-owned (map-get? user-properties { user: tx-sender, property-id: property-id }))))
+      (buyer-user-tokens (default-to u0 (get tokens-owned (map-get? user-properties { user: buyer, property-id: property-id }))))
+    )
+    (asserts! (get is-active buy-offer) err-offer-not-found)
+    (asserts! (<= burn-block-height (get expiry-block buy-offer)) err-offer-expired)
+    (asserts! (<= token-amount (get token-amount buy-offer)) err-insufficient-tokens)
+    (asserts! (>= seller-tokens token-amount) err-insufficient-tokens)
+    (asserts! (> token-amount u0) err-invalid-amount)
+    (try! (as-contract (stx-transfer? total-payment tx-sender tx-sender)))
+    (map-set property-tokens
+      { property-id: property-id, holder: tx-sender }
+      { amount: (- seller-tokens token-amount) }
+    )
+    (map-set property-tokens
+      { property-id: property-id, holder: buyer }
+      { amount: (+ buyer-tokens token-amount) }
+    )
+    (map-set user-properties
+      { user: tx-sender, property-id: property-id }
+      { tokens-owned: (- seller-user-tokens token-amount) }
+    )
+    (map-set user-properties
+      { user: buyer, property-id: property-id }
+      { tokens-owned: (+ buyer-user-tokens token-amount) }
+    )
+    (if (is-eq token-amount (get token-amount buy-offer))
+      (map-set buy-offers
+        { property-id: property-id, buyer: buyer, offer-id: offer-id }
+        (merge buy-offer { is-active: false })
+      )
+      (map-set buy-offers
+        { property-id: property-id, buyer: buyer, offer-id: offer-id }
+        (merge buy-offer { token-amount: (- (get token-amount buy-offer) token-amount) })
+      )
+    )
+    (ok token-amount)
+  )
+)
+
+(define-public (cancel-sell-offer (property-id uint) (offer-id uint))
+  (let
+    (
+      (sell-offer (unwrap! (map-get? sell-offers { property-id: property-id, seller: tx-sender, offer-id: offer-id }) err-offer-not-found))
+    )
+    (asserts! (get is-active sell-offer) err-offer-not-found)
+    (map-set sell-offers
+      { property-id: property-id, seller: tx-sender, offer-id: offer-id }
+      (merge sell-offer { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-buy-offer (property-id uint) (offer-id uint))
+  (let
+    (
+      (buy-offer (unwrap! (map-get? buy-offers { property-id: property-id, buyer: tx-sender, offer-id: offer-id }) err-offer-not-found))
+      (refund-amount (* (get token-amount buy-offer) (get price-per-token buy-offer)))
+    )
+    (asserts! (get is-active buy-offer) err-offer-not-found)
+    (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+    (map-set buy-offers
+      { property-id: property-id, buyer: tx-sender, offer-id: offer-id }
+      (merge buy-offer { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-sell-offer (property-id uint) (seller principal) (offer-id uint))
+  (map-get? sell-offers { property-id: property-id, seller: seller, offer-id: offer-id })
+)
+
+(define-read-only (get-buy-offer (property-id uint) (buyer principal) (offer-id uint))
+  (map-get? buy-offers { property-id: property-id, buyer: buyer, offer-id: offer-id })
+)
+
+(define-read-only (get-user-sell-offer-count (property-id uint) (seller principal))
+  (default-to u0 (get count (map-get? user-sell-offer-count { property-id: property-id, seller: seller })))
+)
+
+(define-read-only (get-user-buy-offer-count (property-id uint) (buyer principal))
+  (default-to u0 (get count (map-get? user-buy-offer-count { property-id: property-id, buyer: buyer })))
+)
+
+(define-read-only (is-sell-offer-active (property-id uint) (seller principal) (offer-id uint))
+  (let
+    (
+      (offer (map-get? sell-offers { property-id: property-id, seller: seller, offer-id: offer-id }))
+    )
+    (match offer
+      o (and (get is-active o) (<= burn-block-height (get expiry-block o)))
+      false
+    )
+  )
+)
+
+(define-read-only (is-buy-offer-active (property-id uint) (buyer principal) (offer-id uint))
+  (let
+    (
+      (offer (map-get? buy-offers { property-id: property-id, buyer: buyer, offer-id: offer-id }))
+    )
+    (match offer
+      o (and (get is-active o) (<= burn-block-height (get expiry-block o)))
+      false
+    )
+  )
+)
+
+(define-read-only (get-sell-offer-value (property-id uint) (seller principal) (offer-id uint))
+  (let
+    (
+      (offer (map-get? sell-offers { property-id: property-id, seller: seller, offer-id: offer-id }))
+    )
+    (match offer
+      o (some (* (get token-amount o) (get price-per-token o)))
+      none
+    )
+  )
+)
+
+(define-read-only (get-buy-offer-value (property-id uint) (buyer principal) (offer-id uint))
+  (let
+    (
+      (offer (map-get? buy-offers { property-id: property-id, buyer: buyer, offer-id: offer-id }))
+    )
+    (match offer
+      o (some (* (get token-amount o) (get price-per-token o)))
+      none
     )
   )
 )

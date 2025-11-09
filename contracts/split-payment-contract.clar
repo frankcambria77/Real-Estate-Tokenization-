@@ -770,3 +770,127 @@
     )
   )
 )
+
+(define-constant err-proposal-not-found (err u117))
+(define-constant err-proposal-already-voted (err u118))
+(define-constant err-proposal-closed (err u119))
+(define-constant err-invalid-duration (err u120))
+(define-constant err-not-token-holder (err u121))
+(define-constant err-proposal-not-ended (err u122))
+
+(define-map governance-proposals
+  { property-id: uint, proposal-id: uint }
+  {
+    creator: principal,
+    yes-votes: uint,
+    no-votes: uint,
+    end-block: uint,
+    executed: bool
+  }
+)
+
+(define-map governance-proposal-count
+  { property-id: uint }
+  { count: uint }
+)
+
+(define-map governance-votes
+  { property-id: uint, proposal-id: uint, voter: principal }
+  {
+    support: bool,
+    weight: uint
+  }
+)
+
+(define-public (create-governance-proposal (property-id uint) (duration-blocks uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+      (holder-tokens (get-user-tokens property-id tx-sender))
+      (count (default-to u0 (get count (map-get? governance-proposal-count { property-id: property-id }))))
+      (next-id (+ count u1))
+      (end (+ burn-block-height duration-blocks))
+    )
+    (asserts! (> duration-blocks u0) err-invalid-duration)
+    (asserts! (> holder-tokens u0) err-not-token-holder)
+    (map-set governance-proposals
+      { property-id: property-id, proposal-id: next-id }
+      {
+        creator: tx-sender,
+        yes-votes: u0,
+        no-votes: u0,
+        end-block: end,
+        executed: false
+      }
+    )
+    (map-set governance-proposal-count
+      { property-id: property-id }
+      { count: next-id }
+    )
+    (ok next-id)
+  )
+)
+
+(define-public (vote-on-governance-proposal (property-id uint) (proposal-id uint) (support bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? governance-proposals { property-id: property-id, proposal-id: proposal-id }) err-proposal-not-found))
+      (existing (map-get? governance-votes { property-id: property-id, proposal-id: proposal-id, voter: tx-sender }))
+      (weight (get-user-tokens property-id tx-sender))
+    )
+    (asserts! (<= burn-block-height (get end-block proposal)) err-proposal-closed)
+    (asserts! (is-none existing) err-proposal-already-voted)
+    (asserts! (> weight u0) err-not-token-holder)
+    (if support
+      (map-set governance-proposals
+        { property-id: property-id, proposal-id: proposal-id }
+        (merge proposal { yes-votes: (+ (get yes-votes proposal) weight) })
+      )
+      (map-set governance-proposals
+        { property-id: property-id, proposal-id: proposal-id }
+        (merge proposal { no-votes: (+ (get no-votes proposal) weight) })
+      )
+    )
+    (map-set governance-votes
+      { property-id: property-id, proposal-id: proposal-id, voter: tx-sender }
+      { support: support, weight: weight }
+    )
+    (ok weight)
+  )
+)
+
+(define-public (finalize-governance-proposal (property-id uint) (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? governance-proposals { property-id: property-id, proposal-id: proposal-id }) err-proposal-not-found))
+      (passed (> (get yes-votes proposal) (get no-votes proposal)))
+    )
+    (asserts! (not (get executed proposal)) err-proposal-closed)
+    (asserts! (>= burn-block-height (get end-block proposal)) err-proposal-not-ended)
+    (if passed
+      (let
+        (
+          (property (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+        )
+        (map-set properties
+          { property-id: property-id }
+          (merge property { is-listed: (not (get is-listed property)) })
+        )
+      )
+      passed
+    )
+    (map-set governance-proposals
+      { property-id: property-id, proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    (ok passed)
+  )
+)
+
+(define-read-only (get-governance-proposal (property-id uint) (proposal-id uint))
+  (map-get? governance-proposals { property-id: property-id, proposal-id: proposal-id })
+)
+
+(define-read-only (get-governance-proposal-count (property-id uint))
+  (default-to u0 (get count (map-get? governance-proposal-count { property-id: property-id })))
+)
